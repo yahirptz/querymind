@@ -9,7 +9,6 @@
 
 A production-quality **RAG-based web application** that lets users ask natural language questions about a relational database and receive accurate SQL queries + plain-English answers — powered by Claude (Anthropic) and semantic search via pgvector.
 
-> **Screenshot placeholder** — add `docs/screenshot.png` after running the app.
 
 ---
 
