@@ -1,0 +1,1193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SQL Query Assistant</title>
+  <style>
+    /* =====================================================================
+       CSS Reset & Variables
+       ===================================================================== */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg-primary:   #0d1117;
+      --bg-secondary: #161b22;
+      --bg-tertiary:  #21262d;
+      --bg-hover:     #30363d;
+      --border:       #30363d;
+      --border-light: #3d444d;
+      --accent:       #2f81f7;
+      --accent-hover: #388bfd;
+      --accent-dim:   #1f4e91;
+      --text-primary: #e6edf3;
+      --text-secondary: #8b949e;
+      --text-muted:   #6e7681;
+      --green:        #3fb950;
+      --red:          #f85149;
+      --yellow:       #d29922;
+      --purple:       #bc8cff;
+      --font-mono:    'Fira Code', 'Cascadia Code', 'JetBrains Mono', monospace;
+      --font-sans:    -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      --radius:       8px;
+      --radius-lg:    12px;
+      --shadow:       0 8px 24px rgba(0,0,0,0.5);
+    }
+
+    body {
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* =====================================================================
+       Top Bar
+       ===================================================================== */
+    #topbar {
+      height: 52px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 20px;
+      gap: 12px;
+      flex-shrink: 0;
+      z-index: 10;
+    }
+
+    #topbar .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text-primary);
+      flex: 1;
+    }
+
+    #topbar .logo svg { color: var(--accent); }
+
+    .badge {
+      background: var(--accent-dim);
+      color: var(--accent);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 20px;
+      letter-spacing: 0.5px;
+    }
+
+    #btn-history {
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 6px 14px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+    }
+    #btn-history:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+      border-color: var(--border-light);
+    }
+
+    /* =====================================================================
+       Layout
+       ===================================================================== */
+    #layout {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* =====================================================================
+       Sidebar
+       ===================================================================== */
+    #sidebar {
+      width: 280px;
+      min-width: 220px;
+      max-width: 380px;
+      background: var(--bg-secondary);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      flex-shrink: 0;
+      resize: horizontal;
+    }
+
+    #sidebar-header {
+      padding: 14px 16px 10px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    #sidebar-header h3 {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-secondary);
+      flex: 1;
+    }
+
+    #schema-status {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      flex-shrink: 0;
+    }
+    #schema-status.connected { background: var(--green); }
+    #schema-status.error { background: var(--red); }
+
+    #schema-tree {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px 0;
+    }
+
+    #schema-tree::-webkit-scrollbar { width: 4px; }
+    #schema-tree::-webkit-scrollbar-track { background: transparent; }
+    #schema-tree::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .tree-table {
+      user-select: none;
+    }
+
+    .tree-table-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 16px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-primary);
+      transition: background 0.1s;
+    }
+    .tree-table-header:hover { background: var(--bg-hover); }
+
+    .tree-table-header .chevron {
+      width: 14px;
+      height: 14px;
+      color: var(--text-muted);
+      transition: transform 0.15s;
+      flex-shrink: 0;
+    }
+    .tree-table-header.open .chevron { transform: rotate(90deg); }
+
+    .tree-table-header .table-icon { color: var(--purple); flex-shrink: 0; }
+
+    .tree-table-cols {
+      display: none;
+      padding: 2px 0;
+    }
+    .tree-table-cols.open { display: block; }
+
+    .tree-col {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 16px 4px 38px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .col-type {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-muted);
+      background: var(--bg-tertiary);
+      padding: 1px 5px;
+      border-radius: 3px;
+      margin-left: auto;
+    }
+
+    .col-pk { color: var(--yellow); }
+    .col-fk { color: var(--accent); }
+
+    /* =====================================================================
+       Main Chat Area
+       ===================================================================== */
+    #main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px 0;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    #messages::-webkit-scrollbar { width: 6px; }
+    #messages::-webkit-scrollbar-track { background: transparent; }
+    #messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* Welcome screen */
+    #welcome {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px;
+      gap: 24px;
+      text-align: center;
+    }
+
+    #welcome .welcome-icon {
+      width: 64px;
+      height: 64px;
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent);
+    }
+
+    #welcome h2 {
+      font-size: 22px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    #welcome p {
+      color: var(--text-secondary);
+      font-size: 14px;
+      max-width: 400px;
+      line-height: 1.6;
+    }
+
+    .example-questions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
+      max-width: 600px;
+    }
+
+    .example-q {
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 8px 14px;
+      font-size: 13px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .example-q:hover {
+      background: var(--bg-hover);
+      border-color: var(--accent);
+      color: var(--text-primary);
+    }
+
+    /* Message bubbles */
+    .msg-row {
+      display: flex;
+      padding: 0 24px;
+      gap: 12px;
+    }
+
+    .msg-row.user {
+      flex-direction: row-reverse;
+    }
+
+    .msg-avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      font-weight: 600;
+      margin-top: 2px;
+    }
+    .msg-row.user .msg-avatar {
+      background: var(--accent);
+      color: #fff;
+    }
+    .msg-row.assistant .msg-avatar {
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      color: var(--purple);
+    }
+
+    .msg-bubble {
+      max-width: 680px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .msg-content {
+      padding: 12px 16px;
+      border-radius: var(--radius-lg);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .msg-row.user .msg-content {
+      background: var(--accent);
+      color: #fff;
+      border-bottom-right-radius: 4px;
+    }
+
+    .msg-row.assistant .msg-content {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      border-bottom-left-radius: 4px;
+    }
+
+    .msg-row.assistant.error .msg-content {
+      background: rgba(248,81,73,0.1);
+      border-color: rgba(248,81,73,0.3);
+      color: var(--red);
+    }
+
+    .summary-text {
+      font-size: 14px;
+      line-height: 1.7;
+      color: var(--text-primary);
+      margin-bottom: 4px;
+    }
+
+    /* Collapsible sections */
+    .collapsible {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      margin-top: 4px;
+    }
+
+    .collapsible-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: var(--bg-tertiary);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      user-select: none;
+      transition: background 0.1s;
+    }
+    .collapsible-header:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+    }
+
+    .collapsible-header .chevron {
+      width: 12px;
+      height: 12px;
+      transition: transform 0.15s;
+      margin-left: auto;
+    }
+    .collapsible-header.open .chevron { transform: rotate(180deg); }
+
+    .collapsible-body {
+      display: none;
+      border-top: 1px solid var(--border);
+    }
+    .collapsible-body.open { display: block; }
+
+    /* SQL display */
+    .sql-block {
+      background: var(--bg-primary);
+      padding: 14px 16px;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.6;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: var(--text-primary);
+    }
+
+    /* SQL syntax highlighting */
+    .kw { color: #ff7b72; font-weight: 600; }
+    .fn { color: #d2a8ff; }
+    .str { color: #a5d6ff; }
+    .num { color: #79c0ff; }
+    .op { color: var(--text-secondary); }
+    .id { color: var(--text-primary); }
+
+    /* Results table */
+    .results-wrap {
+      overflow-x: auto;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .results-wrap::-webkit-scrollbar { width: 4px; height: 4px; }
+    .results-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .results-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      font-family: var(--font-mono);
+    }
+
+    .results-table th {
+      background: var(--bg-tertiary);
+      color: var(--text-secondary);
+      font-weight: 600;
+      padding: 8px 12px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+      position: sticky;
+      top: 0;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .results-table td {
+      padding: 7px 12px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text-primary);
+      max-width: 280px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .results-table tr:last-child td { border-bottom: none; }
+    .results-table tr:hover td { background: var(--bg-hover); }
+
+    .results-count {
+      padding: 8px 12px;
+      font-size: 11px;
+      color: var(--text-muted);
+      border-top: 1px solid var(--border);
+      background: var(--bg-tertiary);
+    }
+
+    /* Loading */
+    .loading-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 24px;
+    }
+
+    .loading-bubble {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      border-bottom-left-radius: 4px;
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .spinner {
+      width: 16px;
+      height: 16px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .loading-text {
+      font-size: 13px;
+      color: var(--text-secondary);
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+    /* =====================================================================
+       Input Bar
+       ===================================================================== */
+    #input-bar {
+      padding: 16px 24px;
+      border-top: 1px solid var(--border);
+      background: var(--bg-primary);
+      flex-shrink: 0;
+    }
+
+    .input-wrapper {
+      display: flex;
+      align-items: flex-end;
+      gap: 10px;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 10px 14px;
+      transition: border-color 0.15s;
+    }
+    .input-wrapper:focus-within {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(47,129,247,0.15);
+    }
+
+    #question-input {
+      flex: 1;
+      background: none;
+      border: none;
+      outline: none;
+      color: var(--text-primary);
+      font-size: 14px;
+      line-height: 1.5;
+      resize: none;
+      min-height: 22px;
+      max-height: 140px;
+      font-family: var(--font-sans);
+    }
+
+    #question-input::placeholder { color: var(--text-muted); }
+
+    #send-btn {
+      width: 36px;
+      height: 36px;
+      background: var(--accent);
+      border: none;
+      border-radius: var(--radius);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      transition: background 0.15s;
+      color: #fff;
+    }
+    #send-btn:hover { background: var(--accent-hover); }
+    #send-btn:disabled { background: var(--bg-hover); cursor: not-allowed; color: var(--text-muted); }
+
+    .input-hint {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 6px;
+      text-align: right;
+    }
+
+    /* =====================================================================
+       Modal
+       ===================================================================== */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.7);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+      backdrop-filter: blur(4px);
+    }
+    .modal-overlay.open { display: flex; }
+
+    .modal {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow);
+      width: 90%;
+      max-width: 860px;
+      max-height: 80vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .modal-header {
+      display: flex;
+      align-items: center;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .modal-header h2 {
+      font-size: 16px;
+      font-weight: 600;
+      flex: 1;
+    }
+
+    .modal-close {
+      width: 28px;
+      height: 28px;
+      background: none;
+      border: none;
+      color: var(--text-secondary);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: var(--radius);
+      transition: all 0.15s;
+    }
+    .modal-close:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+    .modal-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+    }
+    .modal-body::-webkit-scrollbar { width: 4px; }
+    .modal-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .history-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    .history-table th {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text-secondary);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      font-weight: 600;
+    }
+
+    .history-table td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text-primary);
+      vertical-align: top;
+    }
+
+    .history-table tr:last-child td { border-bottom: none; }
+    .history-table tr:hover td { background: var(--bg-hover); }
+
+    .history-table .q-text {
+      max-width: 280px;
+      font-style: italic;
+      color: var(--text-secondary);
+    }
+
+    .history-table .sql-preview {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-muted);
+      max-width: 260px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .history-table .ts {
+      font-size: 11px;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+
+    /* =====================================================================
+       Utilities
+       ===================================================================== */
+    .hidden { display: none !important; }
+
+    @media (max-width: 640px) {
+      #sidebar { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- =========================================================
+     Top Bar
+     ========================================================= -->
+<header id="topbar">
+  <div class="logo">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+    </svg>
+    SQL Query Assistant
+    <span class="badge">RAG + Claude</span>
+  </div>
+  <button id="btn-history" onclick="openHistory()">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+    </svg>
+    History
+  </button>
+</header>
+
+<!-- =========================================================
+     Layout
+     ========================================================= -->
+<div id="layout">
+
+  <!-- Sidebar: Schema Tree -->
+  <aside id="sidebar">
+    <div id="sidebar-header">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--purple)">
+        <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/>
+      </svg>
+      <h3>Schema</h3>
+      <div id="schema-status" title="Loading..."></div>
+    </div>
+    <div id="schema-tree">
+      <div style="padding:20px 16px;color:var(--text-muted);font-size:12px;">Loading schema...</div>
+    </div>
+  </aside>
+
+  <!-- Main Chat -->
+  <main id="main">
+    <div id="messages">
+      <!-- Welcome screen -->
+      <div id="welcome">
+        <div class="welcome-icon">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+        </div>
+        <h2>Ask anything about your database</h2>
+        <p>Ask in plain English — the AI will retrieve relevant schema context, generate SQL, execute it, and explain the results.</p>
+        <div class="example-questions">
+          <div class="example-q" onclick="useExample(this)">What are the top 5 selling artists?</div>
+          <div class="example-q" onclick="useExample(this)">How many customers are from the USA?</div>
+          <div class="example-q" onclick="useExample(this)">What is the total revenue by country?</div>
+          <div class="example-q" onclick="useExample(this)">Which albums have more than 15 tracks?</div>
+          <div class="example-q" onclick="useExample(this)">Who are the top 3 customers by spending?</div>
+          <div class="example-q" onclick="useExample(this)">What genre has the most tracks?</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Input Bar -->
+    <div id="input-bar">
+      <div class="input-wrapper">
+        <textarea
+          id="question-input"
+          placeholder="Ask a question about your data..."
+          rows="1"
+          onkeydown="handleKeydown(event)"
+          oninput="autoResize(this)"
+        ></textarea>
+        <button id="send-btn" onclick="submitQuestion()" title="Send (Enter)">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+          </svg>
+        </button>
+      </div>
+      <div class="input-hint">Press Enter to send &nbsp;·&nbsp; Shift+Enter for new line</div>
+    </div>
+  </main>
+</div>
+
+<!-- =========================================================
+     History Modal
+     ========================================================= -->
+<div class="modal-overlay" id="history-modal" onclick="closeHistoryOnOverlay(event)">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>Query History</h2>
+      <button class="modal-close" onclick="closeHistory()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
+    </div>
+    <div class="modal-body" id="history-body">
+      <div class="empty-state">Loading history...</div>
+    </div>
+  </div>
+</div>
+
+<script>
+  /* =====================================================================
+     State
+     ===================================================================== */
+  let isLoading = false;
+
+  /* =====================================================================
+     Schema Sidebar
+     ===================================================================== */
+  async function loadSchema() {
+    const tree = document.getElementById('schema-tree');
+    const status = document.getElementById('schema-status');
+    try {
+      const res = await fetch('/api/schema');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const tables = await res.json();
+
+      if (!Array.isArray(tables) || tables.length === 0) {
+        tree.innerHTML = '<div style="padding:20px 16px;color:var(--text-muted);font-size:12px;">No tables found.</div>';
+        status.className = 'error';
+        status.title = 'No schema data';
+        return;
+      }
+
+      status.className = 'connected';
+      status.title = `${tables.length} tables loaded`;
+
+      tree.innerHTML = tables.map(table => {
+        const cols = (table.columns || []).map(col => {
+          const pk = col.is_primary ? '<span class="col-pk" title="Primary Key">🔑</span>' : '';
+          const fkInfo = (table.foreign_keys || []).find(f => f.column === col.name);
+          const fk = fkInfo ? '<span class="col-fk" title="Foreign Key">↗</span>' : '';
+          return `
+            <div class="tree-col">
+              ${pk}${fk}
+              <span>${col.name}</span>
+              <span class="col-type">${col.type}</span>
+            </div>`;
+        }).join('');
+
+        const tableId = `table-${table.table_name}`;
+        return `
+          <div class="tree-table">
+            <div class="tree-table-header" onclick="toggleTable('${tableId}', this)">
+              <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+              <svg class="table-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
+              ${table.table_name}
+              <span style="margin-left:auto;font-size:11px;color:var(--text-muted)">${(table.columns||[]).length}</span>
+            </div>
+            <div class="tree-table-cols" id="${tableId}">${cols}</div>
+          </div>`;
+      }).join('');
+
+    } catch (err) {
+      status.className = 'error';
+      status.title = 'Schema load failed';
+      tree.innerHTML = `<div style="padding:20px 16px;color:var(--red);font-size:12px;">Failed to load schema.<br>${err.message}</div>`;
+    }
+  }
+
+  function toggleTable(id, header) {
+    const cols = document.getElementById(id);
+    const isOpen = cols.classList.toggle('open');
+    header.classList.toggle('open', isOpen);
+  }
+
+  /* =====================================================================
+     Chat
+     ===================================================================== */
+  function useExample(el) {
+    const input = document.getElementById('question-input');
+    input.value = el.textContent;
+    autoResize(input);
+    input.focus();
+  }
+
+  function handleKeydown(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      submitQuestion();
+    }
+  }
+
+  function autoResize(el) {
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+  }
+
+  async function submitQuestion() {
+    if (isLoading) return;
+    const input = document.getElementById('question-input');
+    const question = input.value.trim();
+    if (!question) return;
+
+    // Hide welcome screen
+    const welcome = document.getElementById('welcome');
+    if (welcome) welcome.remove();
+
+    input.value = '';
+    input.style.height = 'auto';
+    setLoading(true);
+
+    appendUserMessage(question);
+    const loadingEl = appendLoading();
+
+    try {
+      const res = await fetch('/api/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question }),
+      });
+      const data = await res.json();
+      loadingEl.remove();
+
+      if (!res.ok || data.error) {
+        if (data.error === 'CANNOT_ANSWER' || (data.summary && data.error === 'CANNOT_ANSWER')) {
+          appendAssistantMessage({ summary: data.summary, sql: null, results: [] });
+        } else {
+          appendError(data.error || `Server error (${res.status})`);
+        }
+      } else {
+        appendAssistantMessage(data);
+      }
+    } catch (err) {
+      loadingEl.remove();
+      appendError('Network error — could not reach the server. Please check your connection.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function setLoading(state) {
+    isLoading = state;
+    const btn = document.getElementById('send-btn');
+    btn.disabled = state;
+  }
+
+  function appendUserMessage(text) {
+    const msgs = document.getElementById('messages');
+    const row = document.createElement('div');
+    row.className = 'msg-row user';
+    row.innerHTML = `
+      <div class="msg-avatar">U</div>
+      <div class="msg-bubble">
+        <div class="msg-content">${escapeHtml(text)}</div>
+      </div>`;
+    msgs.appendChild(row);
+    scrollToBottom();
+  }
+
+  function appendLoading() {
+    const msgs = document.getElementById('messages');
+    const row = document.createElement('div');
+    row.className = 'loading-row';
+    row.innerHTML = `
+      <div class="msg-avatar" style="width:32px;height:32px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:50%;display:flex;align-items:center;justify-content:center;color:var(--purple);flex-shrink:0;font-size:13px">AI</div>
+      <div class="loading-bubble">
+        <div class="spinner"></div>
+        <span class="loading-text">Thinking...</span>
+      </div>`;
+    msgs.appendChild(row);
+    scrollToBottom();
+    return row;
+  }
+
+  function appendError(message) {
+    const msgs = document.getElementById('messages');
+    const row = document.createElement('div');
+    row.className = 'msg-row assistant error';
+    row.innerHTML = `
+      <div class="msg-avatar">AI</div>
+      <div class="msg-bubble">
+        <div class="msg-content">
+          <strong>Error:</strong> ${escapeHtml(message)}
+        </div>
+      </div>`;
+    msgs.appendChild(row);
+    scrollToBottom();
+  }
+
+  function appendAssistantMessage(data) {
+    const msgs = document.getElementById('messages');
+    const row = document.createElement('div');
+    row.className = 'msg-row assistant';
+
+    const sqlSection = data.sql ? buildSqlSection(data.sql) : '';
+    const resultsSection = (data.results && data.results.length > 0)
+      ? buildResultsSection(data.results)
+      : '';
+
+    row.innerHTML = `
+      <div class="msg-avatar">AI</div>
+      <div class="msg-bubble">
+        <div class="msg-content">
+          <div class="summary-text">${escapeHtml(data.summary || 'No summary available.')}</div>
+          ${sqlSection}
+          ${resultsSection}
+        </div>
+      </div>`;
+
+    msgs.appendChild(row);
+    scrollToBottom();
+  }
+
+  function buildSqlSection(sql) {
+    const highlighted = highlightSql(sql);
+    const id = 'sql-' + Date.now();
+    return `
+      <div class="collapsible">
+        <div class="collapsible-header" onclick="toggleCollapsible('${id}', this)">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+          View SQL
+          <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+        <div class="collapsible-body" id="${id}">
+          <div class="sql-block">${highlighted}</div>
+        </div>
+      </div>`;
+  }
+
+  function buildResultsSection(results) {
+    if (!results || results.length === 0) return '';
+    const id = 'res-' + Date.now();
+    const headers = Object.keys(results[0]);
+    const headerHtml = headers.map(h => `<th>${escapeHtml(h)}</th>`).join('');
+    const rowsHtml = results.map(row =>
+      `<tr>${headers.map(h => `<td title="${escapeHtml(String(row[h] ?? ''))}">${escapeHtml(String(row[h] ?? 'NULL'))}</td>`).join('')}</tr>`
+    ).join('');
+
+    return `
+      <div class="collapsible">
+        <div class="collapsible-header" onclick="toggleCollapsible('${id}', this)">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
+          View Raw Results
+          <span style="margin-left:4px;background:var(--accent-dim);color:var(--accent);font-size:10px;padding:1px 6px;border-radius:10px">${results.length}</span>
+          <svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+        <div class="collapsible-body" id="${id}">
+          <div class="results-wrap">
+            <table class="results-table">
+              <thead><tr>${headerHtml}</tr></thead>
+              <tbody>${rowsHtml}</tbody>
+            </table>
+          </div>
+          <div class="results-count">${results.length} row${results.length !== 1 ? 's' : ''} returned</div>
+        </div>
+      </div>`;
+  }
+
+  function toggleCollapsible(id, header) {
+    const body = document.getElementById(id);
+    const isOpen = body.classList.toggle('open');
+    header.classList.toggle('open', isOpen);
+  }
+
+  function scrollToBottom() {
+    const msgs = document.getElementById('messages');
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  /* =====================================================================
+     SQL Syntax Highlighting
+     ===================================================================== */
+  function highlightSql(sql) {
+    const keywords = [
+      'SELECT','FROM','WHERE','JOIN','LEFT','RIGHT','INNER','OUTER','FULL',
+      'ON','AS','AND','OR','NOT','IN','LIKE','BETWEEN','IS','NULL','ORDER',
+      'BY','GROUP','HAVING','LIMIT','OFFSET','DISTINCT','COUNT','SUM','AVG',
+      'MIN','MAX','CASE','WHEN','THEN','ELSE','END','WITH','UNION','ALL',
+      'EXISTS','INTO','VALUES','SET','DESC','ASC','OVER','PARTITION','COALESCE',
+      'CAST','EXTRACT','DATE_TRUNC'
+    ];
+    const escaped = escapeHtml(sql);
+    return escaped.replace(/\b([A-Za-z_][A-Za-z0-9_]*)\b/g, (match) => {
+      if (keywords.includes(match.toUpperCase())) {
+        return `<span class="kw">${match}</span>`;
+      }
+      return match;
+    })
+    .replace(/'([^']*)'/g, `<span class="str">'$1'</span>`)
+    .replace(/\b(\d+(\.\d+)?)\b/g, `<span class="num">$1</span>`);
+  }
+
+  /* =====================================================================
+     History Modal
+     ===================================================================== */
+  async function openHistory() {
+    document.getElementById('history-modal').classList.add('open');
+    const body = document.getElementById('history-body');
+    body.innerHTML = '<div class="empty-state">Loading...</div>';
+
+    try {
+      const res = await fetch('/api/history');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const records = await res.json();
+
+      if (!records || records.length === 0) {
+        body.innerHTML = '<div class="empty-state">No query history yet. Ask your first question!</div>';
+        return;
+      }
+
+      const rows = records.map(r => {
+        const ts = r.created_at ? new Date(r.created_at).toLocaleString() : '—';
+        const sqlPreview = (r.sql || 'CANNOT_ANSWER').slice(0, 80);
+        return `
+          <tr>
+            <td class="q-text">${escapeHtml(r.question || '')}</td>
+            <td><div class="sql-preview">${escapeHtml(sqlPreview)}${r.sql && r.sql.length > 80 ? '…' : ''}</div></td>
+            <td style="text-align:center">${r.result_count ?? '—'}</td>
+            <td class="ts">${ts}</td>
+          </tr>`;
+      }).join('');
+
+      body.innerHTML = `
+        <table class="history-table">
+          <thead>
+            <tr>
+              <th>Question</th>
+              <th>SQL</th>
+              <th style="text-align:center">Rows</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    } catch (err) {
+      body.innerHTML = `<div class="empty-state" style="color:var(--red)">Failed to load history: ${escapeHtml(err.message)}</div>`;
+    }
+  }
+
+  function closeHistory() {
+    document.getElementById('history-modal').classList.remove('open');
+  }
+
+  function closeHistoryOnOverlay(e) {
+    if (e.target === document.getElementById('history-modal')) closeHistory();
+  }
+
+  /* =====================================================================
+     Utilities
+     ===================================================================== */
+  function escapeHtml(str) {
+    if (str == null) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  /* =====================================================================
+     Keyboard shortcut: Escape closes modal
+     ===================================================================== */
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeHistory();
+  });
+
+  /* =====================================================================
+     Init
+     ===================================================================== */
+  loadSchema();
+</script>
+</body>
+</html>
