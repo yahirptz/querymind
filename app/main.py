@@ -285,22 +285,44 @@ def create_app() -> Flask:
             logger.error("CSV table creation failed: %s", exc)
             return jsonify({"error": f"Failed to load data into database: {exc}"}), 500
 
-        # Re-embed the full schema so the new table is immediately queryable
+        # Embed the full schema into pgvector so semantic search stays current.
+        # Errors are surfaced — never swallowed silently.
+        embedding_warning: str | None = None
         try:
-            from app.embeddings import embed_and_store_schema
+            from app.embeddings import embed_and_store_schema, verify_embeddings_exist
             all_meta = get_schema_metadata()
             if all_meta:
                 chunks = parse_schema_to_chunks(all_meta)
                 embed_and_store_schema(chunks)
-                logger.info("Full schema re-embedded after CSV upload (%d tables).", len(all_meta))
-        except Exception as exc:
-            logger.warning("Schema re-embedding after upload failed (non-fatal): %s", exc)
+                logger.info("Schema re-embedded after CSV upload (%d tables).", len(all_meta))
 
-        return jsonify({
+            # Verify the new table's embedding was actually stored
+            missing = verify_embeddings_exist([table_name])
+            if missing:
+                embedding_warning = (
+                    f"Table '{table_name}' was created but its schema could not be "
+                    "indexed in pgvector. Queries will still work via direct DB lookup, "
+                    "but semantic search accuracy may be reduced. Try re-uploading if issues persist."
+                )
+                logger.warning("Embedding verification failed for: %s", missing)
+            else:
+                logger.info("Embedding verified for table '%s'.", table_name)
+        except Exception as exc:
+            embedding_warning = (
+                f"Table '{table_name}' was created successfully, but schema indexing "
+                f"failed: {exc}. Queries will still work via direct DB lookup."
+            )
+            logger.error("Schema embedding failed after CSV upload: %s", exc)
+
+        response: dict = {
             "message": f"Table '{table_name}' created with {row_count:,} rows.",
             "table_name": table_name,
             "row_count": row_count,
-        }), 200
+        }
+        if embedding_warning:
+            response["embedding_warning"] = embedding_warning
+
+        return jsonify(response), 200
 
     # -----------------------------------------------------------------------
     # List user-uploaded tables

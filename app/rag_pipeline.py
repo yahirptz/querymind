@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.claude_client import generate_sql, summarize_results
 from app.db import SQLExecutionError, execute_readonly_query, get_engine, get_schema_metadata
-from app.embeddings import retrieve_relevant_schema
+from app.embeddings import retrieve_relevant_schema, verify_embeddings_exist
 from app.models import QueryHistory
 from app.schema_parser import parse_schema_to_chunks
 
@@ -147,28 +147,63 @@ def handle_question(question: str, tables_filter: list[str] | None = None) -> di
     _validate_question(question)
     logger.info("Handling question: '%.100s'", question)
 
-    # Step 2: Fetch schema directly from the database — always accurate and never
-    # depends on pgvector embeddings being up-to-date. Filter to specific tables
-    # when a source is selected, otherwise include everything.
+    # Step 2: Retrieve schema via pgvector semantic search (primary path).
+    # Then verify every relevant table was actually found; fetch any that are
+    # missing directly from information_schema as a reliable fallback.
     try:
         all_meta = get_schema_metadata()
-        if tables_filter:
-            allowed = set(tables_filter)
-            meta = [t for t in all_meta if t["table_name"] in allowed]
-            if not meta:
-                raise RuntimeError(
-                    f"No schema found for tables: {', '.join(tables_filter)}. "
-                    "The table may not exist in the database."
-                )
-        else:
-            meta = all_meta
-        schema_chunks = parse_schema_to_chunks(meta)
-        logger.info("Schema loaded from DB: %d table(s).", len(meta))
-    except RuntimeError:
-        raise
     except Exception as exc:
-        logger.error("Schema fetch failed: %s", exc)
+        logger.error("DB schema fetch failed: %s", exc)
         raise RuntimeError("Failed to retrieve schema from the database.") from exc
+
+    # Determine the candidate table set (respects tables_filter if set)
+    if tables_filter:
+        allowed = set(tables_filter)
+        candidate_meta = [t for t in all_meta if t["table_name"] in allowed]
+        if not candidate_meta:
+            raise RuntimeError(
+                f"No schema found for tables: {', '.join(tables_filter)}. "
+                "The table may not exist in the database."
+            )
+        candidate_names = [t["table_name"] for t in candidate_meta]
+    else:
+        candidate_meta = all_meta
+        candidate_names = [t["table_name"] for t in all_meta]
+
+    # Primary: pgvector semantic search
+    pgvector_chunks: list[str] = []
+    try:
+        pgvector_chunks = retrieve_relevant_schema(question, top_k=200)
+        # Narrow to candidate tables only
+        if tables_filter:
+            pgvector_chunks = [
+                c for c in pgvector_chunks
+                if not c.startswith("Table: ") or
+                   c.split("|")[0].replace("Table: ", "").strip() in allowed
+            ]
+    except Exception as exc:
+        logger.warning("pgvector retrieval failed, will use direct DB fallback: %s", exc)
+
+    # Determine which candidate tables are missing from pgvector results
+    found_in_pgvector: set[str] = set()
+    for chunk in pgvector_chunks:
+        if chunk.startswith("Table: "):
+            found_in_pgvector.add(chunk.split("|")[0].replace("Table: ", "").strip())
+
+    missing_tables = [n for n in candidate_names if n not in found_in_pgvector]
+
+    # Fallback: fetch missing tables directly from information_schema
+    fallback_chunks: list[str] = []
+    if missing_tables:
+        logger.warning(
+            "Falling back to direct DB schema for %d table(s) not in pgvector: %s",
+            len(missing_tables), missing_tables,
+        )
+        missing_meta = [t for t in candidate_meta if t["table_name"] in set(missing_tables)]
+        fallback_chunks = parse_schema_to_chunks(missing_meta)
+
+    # Merge: pgvector results first (ranked by relevance), fallback appended
+    schema_chunks = pgvector_chunks + fallback_chunks
 
     # Step 3: Guard — schema must be non-empty
     if not schema_chunks:

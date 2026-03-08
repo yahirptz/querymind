@@ -219,6 +219,68 @@
     .col-pk { color: var(--yellow); }
     .col-fk { color: var(--accent); }
 
+    /* Schema group headers */
+    .schema-group-header {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 10px 16px 5px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.9px;
+      color: var(--text-muted);
+      border-top: 1px solid var(--border);
+      margin-top: 4px;
+    }
+    .schema-group-header:first-child { border-top: none; margin-top: 0; }
+    .schema-group-header .group-count {
+      margin-left: auto;
+      background: var(--bg-tertiary);
+      padding: 1px 6px;
+      border-radius: 10px;
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0;
+    }
+
+    /* Source selector bar */
+    #source-bar {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 7px 14px 3px;
+      flex-wrap: wrap;
+    }
+    #source-bar .source-label {
+      font-size: 11px;
+      color: var(--text-muted);
+      flex-shrink: 0;
+      margin-right: 2px;
+    }
+    .source-pill {
+      background: var(--bg-tertiary);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 2px 10px;
+      border-radius: 20px;
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.12s;
+      white-space: nowrap;
+      font-family: var(--font-sans);
+    }
+    .source-pill:hover {
+      border-color: var(--border-light);
+      color: var(--text-primary);
+    }
+    .source-pill.active {
+      background: var(--accent-dim);
+      border-color: var(--accent);
+      color: var(--accent);
+      font-weight: 600;
+    }
+
     /* =====================================================================
        Main Chat Area
        ===================================================================== */
@@ -895,6 +957,12 @@
       border: 1px solid rgba(248,81,73,0.3);
       color: var(--red);
     }
+    .upload-feedback.warning {
+      display: block;
+      background: rgba(210,153,34,0.1);
+      border: 1px solid rgba(210,153,34,0.3);
+      color: var(--yellow);
+    }
 
     /* Tables List */
     .tables-list-item {
@@ -1008,7 +1076,7 @@
           </svg>
         </div>
         <h2>Ask anything about your database</h2>
-        <p>Ask in plain English — the AI will retrieve relevant schema context, generate SQL, execute it, and explain the results.</p>
+        <p>Ask in plain English — Query Assistant will retrieve relevant schema context, generate SQL, execute it, and explain the results.</p>
         <div class="example-questions">
           <div class="example-q" onclick="useExample(this)">What are the top 5 selling artists?</div>
           <div class="example-q" onclick="useExample(this)">How many customers are from the USA?</div>
@@ -1022,6 +1090,10 @@
 
     <!-- Input Bar -->
     <div id="input-bar">
+      <div id="source-bar">
+        <span class="source-label">Source:</span>
+        <button class="source-pill active" id="pill-all" onclick="selectAll()">All</button>
+      </div>
       <div class="input-wrapper">
         <textarea
           id="question-input"
@@ -1132,6 +1204,8 @@
      State
      ===================================================================== */
   let isLoading = false;
+  // null = All (no filter). Set<string> = only these table names.
+  let selectedTables = null;
 
   /* =====================================================================
      Schema Sidebar
@@ -1140,11 +1214,16 @@
     const tree = document.getElementById('schema-tree');
     const status = document.getElementById('schema-status');
     try {
-      const res = await fetch('/api/schema');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const tables = await res.json();
+      const [schemaRes, uploadsRes] = await Promise.all([
+        fetch('/api/schema'),
+        fetch('/api/tables'),
+      ]);
+      if (!schemaRes.ok) throw new Error(`HTTP ${schemaRes.status}`);
+      const allTables = await schemaRes.json();
+      const uploadedRaw = uploadsRes.ok ? await uploadsRes.json() : [];
+      const uploadedNames = new Set((uploadedRaw || []).map(t => t.table_name));
 
-      if (!Array.isArray(tables) || tables.length === 0) {
+      if (!Array.isArray(allTables) || allTables.length === 0) {
         tree.innerHTML = '<div style="padding:20px 16px;color:var(--text-muted);font-size:12px;">No tables found.</div>';
         status.className = 'error';
         status.title = 'No schema data';
@@ -1152,21 +1231,18 @@
       }
 
       status.className = 'connected';
-      status.title = `${tables.length} tables loaded`;
+      status.title = `${allTables.length} tables loaded`;
 
-      tree.innerHTML = tables.map(table => {
+      const chinookTables  = allTables.filter(t => !uploadedNames.has(t.table_name));
+      const uploadedTables = allTables.filter(t =>  uploadedNames.has(t.table_name));
+
+      function renderTableItem(table) {
         const cols = (table.columns || []).map(col => {
           const pk = col.is_primary ? '<span class="col-pk" title="Primary Key">🔑</span>' : '';
           const fkInfo = (table.foreign_keys || []).find(f => f.column === col.name);
           const fk = fkInfo ? '<span class="col-fk" title="Foreign Key">↗</span>' : '';
-          return `
-            <div class="tree-col">
-              ${pk}${fk}
-              <span>${col.name}</span>
-              <span class="col-type">${col.type}</span>
-            </div>`;
+          return `<div class="tree-col">${pk}${fk}<span>${col.name}</span><span class="col-type">${col.type}</span></div>`;
         }).join('');
-
         const tableId = `table-${table.table_name}`;
         return `
           <div class="tree-table">
@@ -1178,13 +1254,91 @@
             </div>
             <div class="tree-table-cols" id="${tableId}">${cols}</div>
           </div>`;
-      }).join('');
+      }
+
+      let html = '';
+      if (chinookTables.length > 0) {
+        html += `<div class="schema-group-header">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+          Chinook Database
+          <span class="group-count">${chinookTables.length}</span>
+        </div>`;
+        html += chinookTables.map(renderTableItem).join('');
+      }
+      if (uploadedTables.length > 0) {
+        html += `<div class="schema-group-header">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+          Your Uploads
+          <span class="group-count">${uploadedTables.length}</span>
+        </div>`;
+        html += uploadedTables.map(renderTableItem).join('');
+      }
+
+      tree.innerHTML = html;
+      refreshSourcePills(chinookTables, uploadedTables);
 
     } catch (err) {
       status.className = 'error';
       status.title = 'Schema load failed';
       tree.innerHTML = `<div style="padding:20px 16px;color:var(--red);font-size:12px;">Failed to load schema.<br>${err.message}</div>`;
     }
+  }
+
+  function refreshSourcePills(chinookTables, uploadedTables) {
+    const bar = document.getElementById('source-bar');
+    const chinookNames = chinookTables.map(t => t.table_name);
+    let pills = `<span class="source-label">Source:</span>
+      <button class="source-pill" id="pill-all" onclick="selectAll()">All</button>`;
+    if (chinookTables.length > 0) {
+      pills += `<button class="source-pill" onclick='toggleSource(${JSON.stringify(chinookNames)})'>Chinook</button>`;
+    }
+    for (const t of uploadedTables) {
+      pills += `<button class="source-pill" onclick='toggleSource(${JSON.stringify([t.table_name])})'>${escapeHtml(t.table_name)}</button>`;
+    }
+    bar.innerHTML = pills;
+    syncPillUI();
+  }
+
+  // Clear all filters → query everything
+  function selectAll() {
+    selectedTables = null;
+    syncPillUI();
+  }
+
+  // Toggle a group of table names in/out of the selection.
+  // All pills behave the same: click adds them, click again removes them.
+  function toggleSource(names) {
+    if (selectedTables === null) {
+      selectedTables = new Set(names);
+    } else {
+      const allIn = names.every(n => selectedTables.has(n));
+      if (allIn) {
+        names.forEach(n => selectedTables.delete(n));
+        if (selectedTables.size === 0) selectedTables = null;
+      } else {
+        names.forEach(n => selectedTables.add(n));
+      }
+    }
+    syncPillUI();
+  }
+
+  // Keep pill active states in sync with selectedTables
+  function syncPillUI() {
+    const bar = document.getElementById('source-bar');
+    if (!bar) return;
+    const allBtn = bar.querySelector('#pill-all');
+    if (allBtn) allBtn.classList.toggle('active', selectedTables === null);
+
+    bar.querySelectorAll('.source-pill:not(#pill-all)').forEach(btn => {
+      // Read the table names this pill controls from its onclick attribute
+      const match = btn.getAttribute('onclick').match(/toggleSource\((\[.*?\])/);
+      if (!match) return;
+      try {
+        const names = JSON.parse(match[1]);
+        const active = selectedTables !== null && names.every(n => selectedTables.has(n));
+        btn.classList.toggle('active', active);
+      } catch (_) {}
+    });
   }
 
   function toggleTable(id, header) {
@@ -1236,7 +1390,7 @@
       const res = await fetch('/api/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question, ...(selectedTables ? { tables: Array.from(selectedTables) } : {}) }),
       });
       const data = await res.json();
       loadingEl.remove();
@@ -1282,7 +1436,7 @@
     const row = document.createElement('div');
     row.className = 'loading-row';
     row.innerHTML = `
-      <div class="msg-avatar" style="width:32px;height:32px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:50%;display:flex;align-items:center;justify-content:center;color:var(--purple);flex-shrink:0;font-size:13px">AI</div>
+      <div class="msg-avatar" style="width:32px;height:32px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:50%;display:flex;align-items:center;justify-content:center;color:var(--purple);flex-shrink:0;font-size:13px">QA</div>
       <div class="loading-bubble">
         <div class="spinner"></div>
         <span class="loading-text">Thinking...</span>
@@ -1297,7 +1451,7 @@
     const row = document.createElement('div');
     row.className = 'msg-row assistant error';
     row.innerHTML = `
-      <div class="msg-avatar">AI</div>
+      <div class="msg-avatar">QA</div>
       <div class="msg-bubble">
         <div class="msg-content">
           <strong>Error:</strong> ${escapeHtml(message)}
@@ -1318,7 +1472,7 @@
       : '';
 
     row.innerHTML = `
-      <div class="msg-avatar">AI</div>
+      <div class="msg-avatar">QA</div>
       <div class="msg-bubble">
         <div class="msg-content">
           <div class="summary-text">${escapeHtml(data.summary || 'No summary available.')}</div>
@@ -1593,7 +1747,10 @@
       if (!res.ok) {
         showUploadFeedback(data.error || `Upload failed (${res.status})`, 'error');
       } else {
-        showUploadFeedback(data.message, 'success');
+        const msg = data.embedding_warning
+          ? `${data.message} ⚠️ ${data.embedding_warning}`
+          : data.message;
+        showUploadFeedback(msg, data.embedding_warning ? 'warning' : 'success');
         // Reset file picker
         _selectedFile = null;
         document.getElementById('csv-file-input').value = '';

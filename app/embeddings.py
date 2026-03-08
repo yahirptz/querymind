@@ -6,7 +6,6 @@ import logging
 from typing import Any
 
 import numpy as np
-from pgvector.sqlalchemy import Vector
 from sentence_transformers import SentenceTransformer
 from sqlalchemy import text
 
@@ -77,10 +76,8 @@ def embed_and_store_schema(chunks: list[str]) -> None:
     """
     Generate embeddings for schema chunks and upsert them into schema_embeddings.
 
-    Existing rows with the same chunk_text are updated in place (upsert by text).
-
-    Args:
-        chunks: List of natural-language schema description strings.
+    Raises:
+        RuntimeError: If embedding or storage fails — never swallowed silently.
     """
     if not chunks:
         logger.warning("embed_and_store_schema called with empty chunk list.")
@@ -90,7 +87,12 @@ def embed_and_store_schema(chunks: list[str]) -> None:
     model = _get_model()
 
     logger.info("Embedding %d schema chunks...", len(chunks))
-    vectors: np.ndarray = model.encode(chunks, show_progress_bar=False, normalize_embeddings=True)
+    try:
+        vectors: np.ndarray = model.encode(
+            chunks, show_progress_bar=False, normalize_embeddings=True
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Sentence-transformer encoding failed: {exc}") from exc
 
     upsert_sql = text("""
         INSERT INTO schema_embeddings (chunk_text, embedding)
@@ -100,34 +102,92 @@ def embed_and_store_schema(chunks: list[str]) -> None:
     """)
 
     engine = get_engine()
-    with engine.connect() as conn:
-        for chunk, vec in zip(chunks, vectors):
-            conn.execute(upsert_sql, {
-                "chunk_text": chunk,
-                "embedding": vec.tolist(),
-            })
-        conn.commit()
+    try:
+        with engine.connect() as conn:
+            for chunk, vec in zip(chunks, vectors):
+                conn.execute(upsert_sql, {
+                    "chunk_text": chunk,
+                    "embedding": vec.tolist(),
+                })
+            conn.commit()
+    except Exception as exc:
+        raise RuntimeError(f"Failed to store embeddings in pgvector: {exc}") from exc
 
     logger.info("Stored %d schema embeddings.", len(chunks))
+
+
+def verify_embeddings_exist(table_names: list[str]) -> list[str]:
+    """
+    Check which tables from table_names have NO embedding stored in pgvector.
+
+    Returns:
+        List of table names that are missing from schema_embeddings.
+    """
+    if not table_names:
+        return []
+
+    engine = get_engine()
+    try:
+        with engine.connect() as conn:
+            # Each schema chunk starts with "Table: <name> |"
+            rows = conn.execute(
+                text("SELECT chunk_text FROM schema_embeddings")
+            ).fetchall()
+    except Exception as exc:
+        logger.warning("Could not query schema_embeddings for verification: %s", exc)
+        # If the table doesn't exist yet treat everything as missing
+        return list(table_names)
+
+    embedded_tables: set[str] = set()
+    for (chunk_text,) in rows:
+        if chunk_text.startswith("Table: "):
+            tname = chunk_text.split("|")[0].replace("Table: ", "").strip()
+            embedded_tables.add(tname)
+
+    missing = [t for t in table_names if t not in embedded_tables]
+    if missing:
+        logger.warning("Tables missing from pgvector: %s", missing)
+    return missing
+
+
+def embed_table(table_name: str) -> None:
+    """
+    Embed a single table's schema chunk on demand.
+
+    Fetches the table's metadata from the database, builds the chunk text,
+    and upserts it into schema_embeddings.
+
+    Raises:
+        RuntimeError: If the table is not found or embedding fails.
+    """
+    from app.db import get_schema_metadata
+    from app.schema_parser import parse_schema_to_chunks
+
+    all_meta = get_schema_metadata()
+    meta = [t for t in all_meta if t["table_name"] == table_name]
+    if not meta:
+        raise RuntimeError(
+            f"embed_table: table '{table_name}' not found in database schema."
+        )
+
+    chunks = parse_schema_to_chunks(meta)
+    embed_and_store_schema(chunks)
+    logger.info("On-demand embedding complete for table '%s'.", table_name)
 
 
 def retrieve_relevant_schema(question: str, top_k: int = 5) -> list[str]:
     """
     Embed the question and return the top-k most semantically similar schema chunks.
 
-    Args:
-        question: The user's natural language question.
-        top_k:    Number of chunks to return (default 5).
-
     Returns:
-        List of schema chunk strings ordered by descending cosine similarity.
+        List of chunk strings ordered by descending cosine similarity.
+        Returns an empty list if schema_embeddings is empty or unreachable.
     """
     model = _get_model()
     question_vec: np.ndarray = model.encode(
         [question], show_progress_bar=False, normalize_embeddings=True
     )[0]
 
-    # Cast to list for pgvector compatibility
     vec_list = question_vec.tolist()
 
     similarity_sql = text("""
@@ -138,11 +198,15 @@ def retrieve_relevant_schema(question: str, top_k: int = 5) -> list[str]:
     """)
 
     engine = get_engine()
-    with engine.connect() as conn:
-        rows = conn.execute(similarity_sql, {
-            "query_vec": str(vec_list),
-            "top_k": top_k,
-        }).fetchall()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(similarity_sql, {
+                "query_vec": str(vec_list),
+                "top_k": top_k,
+            }).fetchall()
+    except Exception as exc:
+        logger.warning("pgvector retrieval failed: %s", exc)
+        return []
 
     chunks = [row[0] for row in rows]
     logger.info(
