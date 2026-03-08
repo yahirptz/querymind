@@ -1,4 +1,5 @@
 # QueryMind — AI-Powered SQL Assistant
+<img width="1895" height="897" alt="image" src="https://github.com/user-attachments/assets/0f794b38-3529-4bd7-ad41-50ad432301aa" />
 
 
 ---
