@@ -205,8 +205,3 @@ pytest tests/ -v
 - [ ] Fine-tuned embedding model for SQL schema domains
 - [ ] Natural language schema exploration ("Tell me about the invoices table")
 
----
-
-## License
-
-MIT License — see [LICENSE](LICENSE) for details.
