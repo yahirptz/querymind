@@ -148,7 +148,7 @@ def handle_question(question: str) -> dict[str, Any]:
 
     # Step 2: Retrieve relevant schema chunks via semantic search
     try:
-        schema_chunks = retrieve_relevant_schema(question, top_k=5)
+        schema_chunks = retrieve_relevant_schema(question, top_k=15)
     except Exception as exc:
         logger.error("Schema retrieval failed: %s", exc)
         raise RuntimeError(

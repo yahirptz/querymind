@@ -223,3 +223,64 @@ def get_schema_metadata() -> list[dict[str, Any]]:
 
     logger.info("Schema metadata extracted for %d tables.", len(metadata))
     return metadata
+
+
+# ---------------------------------------------------------------------------
+# CSV → table loader
+# ---------------------------------------------------------------------------
+
+def create_table_from_dataframe(df: Any, table_name: str) -> int:
+    """
+    Create a PostgreSQL table from a pandas DataFrame, replacing it if it exists.
+
+    Infers column types from pandas dtypes (int→BIGINT, float→DOUBLE PRECISION,
+    bool→BOOLEAN, datetime→TIMESTAMP, everything else→TEXT), then uses plain
+    SQLAlchemy Core execute so it works with SQLAlchemy 2.x without touching
+    any DBAPI cursor directly.
+
+    Args:
+        df:         pandas DataFrame with already-sanitised column names.
+        table_name: Sanitised table name (letters, digits, underscores only).
+
+    Returns:
+        Number of rows inserted.
+    """
+    import pandas as pd
+
+    def _pg_type(dtype: Any) -> str:
+        if pd.api.types.is_integer_dtype(dtype):
+            return "BIGINT"
+        if pd.api.types.is_float_dtype(dtype):
+            return "DOUBLE PRECISION"
+        if pd.api.types.is_bool_dtype(dtype):
+            return "BOOLEAN"
+        if pd.api.types.is_datetime64_any_dtype(dtype):
+            return "TIMESTAMP"
+        return "TEXT"
+
+    col_defs = ", ".join(
+        f'"{col}" {_pg_type(dtype)}' for col, dtype in df.dtypes.items()
+    )
+
+    # Replace NaN/NaT with None so psycopg2 sends NULL
+    df = df.where(df.notna(), other=None)
+    records: list[dict] = df.to_dict(orient="records")
+
+    col_names   = ", ".join(f'"{c}"' for c in df.columns)
+    # SQLAlchemy :name bindparams — column names are already sanitised identifiers
+    placeholders = ", ".join(f":{c}" for c in df.columns)
+    insert_sql  = text(f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders})')
+
+    engine = get_engine()
+    with engine.connect() as conn:
+        conn.execute(text(f'DROP TABLE IF EXISTS "{table_name}"'))
+        conn.execute(text(f'CREATE TABLE "{table_name}" ({col_defs})'))
+
+        chunk = 500
+        for i in range(0, len(records), chunk):
+            conn.execute(insert_sql, records[i : i + chunk])
+
+        conn.commit()
+
+    logger.info("Created/replaced table '%s' with %d rows.", table_name, len(df))
+    return len(df)
