@@ -44,7 +44,8 @@ Rules:
 - Do NOT include a semicolon at the end.
 - Never use DROP, DELETE, INSERT, UPDATE, ALTER, CREATE, TRUNCATE, EXEC, or EXECUTE.
 - Use only tables and columns that exist in the provided schema.
-- If the question cannot be answered from the given schema, respond with exactly: CANNOT_ANSWER
+- If the question cannot be answered at all from the given schema, respond with exactly: CANNOT_ANSWER
+- If the question is ambiguous but a reasonable interpretation exists using the available tables, write the SQL for that interpretation.
 
 You will be given:
 1. The user's question

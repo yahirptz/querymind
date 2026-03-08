@@ -152,9 +152,10 @@ def create_app() -> Flask:
             return jsonify({"error": "Request must include a 'question' field."}), 400
 
         question: str = str(body["question"]).strip()
+        tables_filter = body.get("tables") or None  # list[str] | None
 
         try:
-            result = handle_question(question)
+            result = handle_question(question, tables_filter=tables_filter)
             return jsonify(result), 200
 
         except ValueError as exc:
@@ -284,13 +285,14 @@ def create_app() -> Flask:
             logger.error("CSV table creation failed: %s", exc)
             return jsonify({"error": f"Failed to load data into database: {exc}"}), 500
 
-        # Re-embed the new table's schema chunk so it is immediately queryable
+        # Re-embed the full schema so the new table is immediately queryable
         try:
             from app.embeddings import embed_and_store_schema
-            new_meta = [t for t in get_schema_metadata() if t["table_name"] == table_name]
-            if new_meta:
-                chunks = parse_schema_to_chunks(new_meta)
+            all_meta = get_schema_metadata()
+            if all_meta:
+                chunks = parse_schema_to_chunks(all_meta)
                 embed_and_store_schema(chunks)
+                logger.info("Full schema re-embedded after CSV upload (%d tables).", len(all_meta))
         except Exception as exc:
             logger.warning("Schema re-embedding after upload failed (non-fatal): %s", exc)
 

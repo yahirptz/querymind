@@ -10,9 +10,10 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.claude_client import generate_sql, summarize_results
-from app.db import SQLExecutionError, execute_readonly_query, get_engine
+from app.db import SQLExecutionError, execute_readonly_query, get_engine, get_schema_metadata
 from app.embeddings import retrieve_relevant_schema
 from app.models import QueryHistory
+from app.schema_parser import parse_schema_to_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +122,7 @@ def _save_to_history(
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def handle_question(question: str) -> dict[str, Any]:
+def handle_question(question: str, tables_filter: list[str] | None = None) -> dict[str, Any]:
     """
     Full RAG pipeline: validate → retrieve schema → generate SQL → execute → summarize.
 
@@ -146,22 +147,43 @@ def handle_question(question: str) -> dict[str, Any]:
     _validate_question(question)
     logger.info("Handling question: '%.100s'", question)
 
-    # Step 2: Retrieve relevant schema chunks via semantic search
+    # Step 2: Fetch schema directly from the database — always accurate and never
+    # depends on pgvector embeddings being up-to-date. Filter to specific tables
+    # when a source is selected, otherwise include everything.
     try:
-        schema_chunks = retrieve_relevant_schema(question, top_k=15)
+        all_meta = get_schema_metadata()
+        if tables_filter:
+            allowed = set(tables_filter)
+            meta = [t for t in all_meta if t["table_name"] in allowed]
+            if not meta:
+                raise RuntimeError(
+                    f"No schema found for tables: {', '.join(tables_filter)}. "
+                    "The table may not exist in the database."
+                )
+        else:
+            meta = all_meta
+        schema_chunks = parse_schema_to_chunks(meta)
+        logger.info("Schema loaded from DB: %d table(s).", len(meta))
+    except RuntimeError:
+        raise
     except Exception as exc:
-        logger.error("Schema retrieval failed: %s", exc)
-        raise RuntimeError(
-            "Failed to retrieve schema context. Please ensure the schema has been embedded."
-        ) from exc
+        logger.error("Schema fetch failed: %s", exc)
+        raise RuntimeError("Failed to retrieve schema from the database.") from exc
 
+    # Step 3: Guard — schema must be non-empty
     if not schema_chunks:
-        raise RuntimeError(
-            "No schema context found. Please run the schema embedding script first."
-        )
+        raise RuntimeError("No schema context found in the database.")
 
-    # Step 3: Format schema context string
-    schema_context = "\n\n".join(schema_chunks)
+    # Build table list hint so Claude knows exactly which tables are available
+    table_names = []
+    for chunk in schema_chunks:
+        if chunk.startswith("Table: "):
+            tname = chunk.split("|")[0].replace("Table: ", "").strip()
+            table_names.append(tname)
+    table_list_hint = (
+        f"\n\nAvailable tables: {', '.join(table_names)}" if table_names else ""
+    )
+    schema_context = "\n\n".join(schema_chunks) + table_list_hint
 
     # Step 4: Generate SQL via Claude
     try:
