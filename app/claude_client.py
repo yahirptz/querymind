@@ -43,7 +43,8 @@ Rules:
 - No markdown, no code fences, no explanation.
 - Do NOT include a semicolon at the end.
 - Never use DROP, DELETE, INSERT, UPDATE, ALTER, CREATE, TRUNCATE, EXEC, or EXECUTE.
-- Use only tables and columns that exist in the provided schema.
+- CRITICAL: Use table and column names EXACTLY as they appear in the schema context. Do NOT infer, guess, or use common variations. For example, if the schema shows "invoice_line", you must write "invoice_line" — never "invoiceline" or "InvoiceLine".
+- Only reference tables and columns that are explicitly listed in the provided schema. If a table you need is not in the schema, respond with CANNOT_ANSWER.
 - If the question cannot be answered at all from the given schema, respond with exactly: CANNOT_ANSWER
 - If the question is ambiguous but a reasonable interpretation exists using the available tables, write the SQL for that interpretation.
 
@@ -78,7 +79,19 @@ def generate_sql(question: str, schema_context: str) -> str:
     """
     client = _get_client()
 
+    # Extract exact table names from the schema context to pin them explicitly.
+    import re as _re
+    table_names = _re.findall(r"^Table:\s+(\S+?)\s*\|", schema_context, _re.MULTILINE)
+    table_pin = ""
+    if table_names:
+        table_pin = (
+            "EXACT TABLE NAMES YOU MUST USE (copy these character-for-character):\n"
+            + ", ".join(table_names)
+            + "\n\n"
+        )
+
     user_message = (
+        f"{table_pin}"
         f"Schema context:\n{schema_context}\n\n"
         f"Question: {question}"
     )

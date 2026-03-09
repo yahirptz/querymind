@@ -11,7 +11,7 @@ from typing import Any
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
-from app.db import SQLExecutionError, get_schema_metadata
+from app.db import SQLExecutionError, get_engine, get_schema_metadata
 from app.models import QueryHistory, init_db
 from app.rag_pipeline import handle_question
 from app.schema_parser import parse_schema_to_chunks
@@ -29,14 +29,31 @@ logger = logging.getLogger(__name__)
 # Chinook sample-data tables that must never be overwritten or deleted.
 _CHINOOK_TABLES: frozenset[str] = frozenset({
     "album", "artist", "customer", "employee", "genre",
-    "invoice", "invoiceline", "mediatype", "playlist",
-    "playlisttrack", "track",
+    "invoice", "invoice_line", "media_type", "playlist",
+    "playlist_track", "track",
 })
 _INTERNAL_TABLES: frozenset[str] = frozenset({"schema_embeddings", "query_history"})
 _PROTECTED_TABLES: frozenset[str] = _CHINOOK_TABLES | _INTERNAL_TABLES
 
-_MAX_CSV_BYTES = 10 * 1024 * 1024  # 10 MB
-_MAX_CSV_ROWS  = 50_000
+_MAX_CSV_BYTES         = 10  * 1024 * 1024   # 10 MB  — single CSV
+_MAX_ZIP_BYTES         = 100 * 1024 * 1024   # 100 MB — ZIP archive
+_MAX_ZIP_UNCOMPRESSED  = 500 * 1024 * 1024   # 500 MB — bomb guard
+_MAX_ZIP_FILES         = 20
+_MAX_CSV_ROWS          = 50_000
+
+
+def _sanitize_col_names(df) -> None:
+    """Sanitize a DataFrame's column names in-place (SQL-safe, deduped)."""
+    seen: dict[str, int] = {}
+    new_cols: list[str] = []
+    for c in df.columns:
+        s = re.sub(r"[^a-z0-9_]", "_", str(c).strip().lower()) or "col"
+        if not s[0].isalpha():
+            s = "col_" + s
+        count = seen.get(s, 0)
+        seen[s] = count + 1
+        new_cols.append(f"{s}_{count}" if count else s)
+    df.columns = new_cols  # type: ignore[assignment]
 
 
 def _sanitize_table_name(name: str) -> str:
@@ -215,34 +232,54 @@ def create_app() -> Flask:
             return jsonify({"error": "Could not retrieve schema metadata."}), 500
 
     # -----------------------------------------------------------------------
-    # CSV upload
+    # CSV / ZIP upload
     # -----------------------------------------------------------------------
 
     @app.route("/api/upload-csv", methods=["POST"])
     def upload_csv():
         """
-        Accept a CSV file upload and load it into a new PostgreSQL table.
+        Accept a CSV, XLSX, or ZIP file upload and load it into PostgreSQL.
 
         Form fields:
-            file       — multipart CSV file (.csv only, ≤ 10 MB)
-            table_name — desired table name (letters/numbers/underscores)
+            file       — .csv (≤10 MB), .xlsx (≤10 MB), or .zip (≤100 MB)
+            table_name — required for single CSV/XLSX; ignored for ZIP
 
-        Returns:
+        Returns (single file):
             200: {message, table_name, row_count}
-            400: {error} — bad input / validation failure
-            500: {error} — DB or embedding error
+        Returns (ZIP):
+            200: {zip: true, tables: [{table_name, row_count}], skipped: [...]}
         """
+        import zipfile
+        import pandas as pd
+        from app.db import create_table_from_dataframe
+        from app.embeddings import embed_and_store_schema, verify_embeddings_exist
+
         if "file" not in request.files:
             return jsonify({"error": "No file provided."}), 400
 
         f = request.files["file"]
-        if not f.filename or not f.filename.lower().endswith(".csv"):
-            return jsonify({"error": "Only .csv files are accepted."}), 400
+        fname = (f.filename or "").lower()
+
+        _ALLOWED = (".csv", ".xlsx", ".zip")
+        if not fname or not any(fname.endswith(ext) for ext in _ALLOWED):
+            return jsonify({"error": "Only .csv, .xlsx, and .zip files are accepted."}), 400
 
         raw = f.read()
-        if len(raw) > _MAX_CSV_BYTES:
-            return jsonify({"error": "File exceeds the 10 MB size limit."}), 400
+        is_zip = fname.endswith(".zip")
+        max_bytes = _MAX_ZIP_BYTES if is_zip else _MAX_CSV_BYTES
+        limit_label = "100 MB" if is_zip else "10 MB"
+        if len(raw) > max_bytes:
+            return jsonify({"error": f"File exceeds the {limit_label} size limit."}), 400
 
+        # ------------------------------------------------------------------ #
+        #  ZIP branch                                                          #
+        # ------------------------------------------------------------------ #
+        if is_zip:
+            return _handle_zip_upload(raw, embed_and_store_schema)
+
+        # ------------------------------------------------------------------ #
+        #  Single CSV / XLSX branch                                            #
+        # ------------------------------------------------------------------ #
         table_name_raw = request.form.get("table_name", "").strip()
         try:
             table_name = _sanitize_table_name(table_name_raw)
@@ -252,67 +289,50 @@ def create_app() -> Flask:
         if table_name in _PROTECTED_TABLES:
             return jsonify({"error": f"'{table_name}' is a reserved table name."}), 400
 
-        import pandas as pd
         try:
-            df = pd.read_csv(io.BytesIO(raw))
+            if fname.endswith(".xlsx"):
+                df = pd.read_excel(io.BytesIO(raw))
+            else:
+                df = pd.read_csv(io.BytesIO(raw))
         except Exception as exc:
-            return jsonify({"error": f"Could not parse CSV: {exc}"}), 400
+            return jsonify({"error": f"Could not parse file: {exc}"}), 400
 
         if df.empty or len(df.columns) == 0:
-            return jsonify({"error": "CSV file is empty or has no columns."}), 400
+            return jsonify({"error": "File is empty or has no columns."}), 400
 
         if len(df) > _MAX_CSV_ROWS:
             return jsonify({
-                "error": f"CSV has {len(df):,} rows; the maximum is {_MAX_CSV_ROWS:,}."
+                "error": f"File has {len(df):,} rows; the maximum is {_MAX_CSV_ROWS:,}."
             }), 400
 
-        # Sanitize column names, dedup with numeric suffix
-        seen: dict[str, int] = {}
-        new_cols: list[str] = []
-        for c in df.columns:
-            s = re.sub(r"[^a-z0-9_]", "_", str(c).strip().lower()) or "col"
-            if not s[0].isalpha():
-                s = "col_" + s
-            count = seen.get(s, 0)
-            seen[s] = count + 1
-            new_cols.append(f"{s}_{count}" if count else s)
-        df.columns = new_cols  # type: ignore[assignment]
+        _sanitize_col_names(df)
 
         try:
-            from app.db import create_table_from_dataframe
             row_count = create_table_from_dataframe(df, table_name)
         except Exception as exc:
-            logger.error("CSV table creation failed: %s", exc)
+            logger.error("Table creation failed: %s", exc)
             return jsonify({"error": f"Failed to load data into database: {exc}"}), 500
 
-        # Embed the full schema into pgvector so semantic search stays current.
-        # Errors are surfaced — never swallowed silently.
         embedding_warning: str | None = None
         try:
-            from app.embeddings import embed_and_store_schema, verify_embeddings_exist
             all_meta = get_schema_metadata()
             if all_meta:
                 chunks = parse_schema_to_chunks(all_meta)
                 embed_and_store_schema(chunks)
-                logger.info("Schema re-embedded after CSV upload (%d tables).", len(all_meta))
+                logger.info("Schema re-embedded after upload (%d tables).", len(all_meta))
 
-            # Verify the new table's embedding was actually stored
             missing = verify_embeddings_exist([table_name])
             if missing:
                 embedding_warning = (
                     f"Table '{table_name}' was created but its schema could not be "
-                    "indexed in pgvector. Queries will still work via direct DB lookup, "
-                    "but semantic search accuracy may be reduced. Try re-uploading if issues persist."
+                    "indexed in pgvector. Queries will still work via direct DB lookup."
                 )
                 logger.warning("Embedding verification failed for: %s", missing)
-            else:
-                logger.info("Embedding verified for table '%s'.", table_name)
         except Exception as exc:
             embedding_warning = (
-                f"Table '{table_name}' was created successfully, but schema indexing "
-                f"failed: {exc}. Queries will still work via direct DB lookup."
+                f"Table '{table_name}' was created but schema indexing failed: {exc}."
             )
-            logger.error("Schema embedding failed after CSV upload: %s", exc)
+            logger.error("Schema embedding failed after upload: %s", exc)
 
         response: dict = {
             "message": f"Table '{table_name}' created with {row_count:,} rows.",
@@ -321,8 +341,131 @@ def create_app() -> Flask:
         }
         if embedding_warning:
             response["embedding_warning"] = embedding_warning
-
         return jsonify(response), 200
+
+    # -----------------------------------------------------------------------
+    # External database connection
+    # -----------------------------------------------------------------------
+
+    @app.route("/api/connect-db", methods=["POST"])
+    def connect_db():
+        """
+        Connect to an external PostgreSQL database.
+
+        Request body (JSON):
+            {host, port, user, password, database}
+
+        Returns:
+            200: {success: true, table_count: N}
+            400: {error} — invalid input or connection failure
+        """
+        from app.db import set_active_connection, get_engine
+        from app.embeddings import embed_and_store_schema
+        from sqlalchemy import text
+
+        body = request.get_json(silent=True) or {}
+        host     = str(body.get("host", "")).strip()
+        port_raw = body.get("port", 5432)
+        user     = str(body.get("user", "")).strip()
+        password = str(body.get("password", ""))
+        database = str(body.get("database", "")).strip()
+
+        if not host:
+            return jsonify({"error": "Host is required."}), 400
+        if not user:
+            return jsonify({"error": "Username is required."}), 400
+        if not database:
+            return jsonify({"error": "Database name is required."}), 400
+        try:
+            port = int(port_raw)
+            if not (1 <= port <= 65535):
+                raise ValueError()
+        except (ValueError, TypeError):
+            return jsonify({"error": "Port must be a number between 1 and 65535."}), 400
+
+        try:
+            set_active_connection(host, port, user, password, database)
+        except Exception as exc:
+            logger.warning("External DB connection failed: %s", exc)
+            return jsonify({"error": f"Connection failed: {exc}"}), 400
+
+        # Clear old embeddings and re-embed the new database's schema
+        embedding_warning: str | None = None
+        try:
+            with get_engine().connect() as conn:
+                try:
+                    conn.execute(text("DELETE FROM schema_embeddings"))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+
+            meta = get_schema_metadata()
+            if meta:
+                chunks = parse_schema_to_chunks(meta)
+                embed_and_store_schema(chunks)
+                logger.info("Schema re-embedded for external DB (%d tables).", len(meta))
+        except Exception as exc:
+            logger.error("Schema re-embedding after connect failed: %s", exc)
+            embedding_warning = str(exc)
+            try:
+                meta = get_schema_metadata()
+            except Exception:
+                meta = []
+
+        response: dict = {"success": True, "table_count": len(meta)}
+        if embedding_warning:
+            response["embedding_warning"] = embedding_warning
+        return jsonify(response), 200
+
+    @app.route("/api/connections")
+    def get_connections():
+        """
+        Return info about the currently active external connection, or indicate local DB.
+
+        Returns:
+            200: {connected: true, host, port, database, user} or {connected: false}
+        """
+        from app.db import get_active_connection_info
+        info = get_active_connection_info()
+        if info:
+            return jsonify({"connected": True, **info}), 200
+        return jsonify({"connected": False}), 200
+
+    @app.route("/api/connections/reset", methods=["POST"])
+    def reset_connections():
+        """
+        Disconnect from the external database and return to the default local Chinook DB.
+
+        Returns:
+            200: {success: true, message}
+        """
+        from app.db import reset_connection, get_engine
+        from app.embeddings import embed_and_store_schema
+        from sqlalchemy import text
+
+        reset_connection()
+
+        # Re-embed local schema
+        try:
+            with get_engine().connect() as conn:
+                try:
+                    conn.execute(text("DELETE FROM schema_embeddings"))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+
+            meta = get_schema_metadata()
+            if meta:
+                chunks = parse_schema_to_chunks(meta)
+                embed_and_store_schema(chunks)
+                logger.info("Schema re-embedded for local DB after reset (%d tables).", len(meta))
+        except Exception as exc:
+            logger.warning("Schema re-embedding after reset failed (non-fatal): %s", exc)
+
+        return jsonify({
+            "success": True,
+            "message": "Disconnected. Back to local Chinook database.",
+        }), 200
 
     # -----------------------------------------------------------------------
     # List user-uploaded tables
@@ -426,6 +569,202 @@ def create_app() -> Flask:
             return jsonify({"error": f"Failed to delete table: {exc}"}), 500
 
     return app
+
+
+# ---------------------------------------------------------------------------
+# ZIP upload handler
+# ---------------------------------------------------------------------------
+
+def _handle_zip_upload(raw: bytes, embed_fn) -> "flask.Response":
+    """
+    Process a ZIP file upload: extract CSVs, XLSXs, and/or a SQL dump.
+
+    Safety:
+      - Max 100 MB compressed (already checked by caller)
+      - Max 500 MB uncompressed (zip-bomb guard)
+      - Max 20 files
+      - Path-traversal guard (.., leading /)
+      - Only .csv / .xlsx / .sql processed; everything else skipped
+
+    Returns a Flask JSON response directly.
+    """
+    import os
+    import zipfile
+    import pandas as pd
+    from flask import jsonify
+    from app.db import create_table_from_dataframe, execute_sql_dump
+    from app.embeddings import embed_and_store_schema
+    from sqlalchemy import text as sqla_text
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile:
+        return jsonify({"error": "Uploaded file is not a valid ZIP archive."}), 400
+
+    # Zip-bomb guard
+    total_uncompressed = sum(info.file_size for info in zf.infolist())
+    if total_uncompressed > _MAX_ZIP_UNCOMPRESSED:
+        return jsonify({
+            "error": f"ZIP contents exceed the {_MAX_ZIP_UNCOMPRESSED // (1024**2):,} MB uncompressed limit."
+        }), 400
+
+    members = [m for m in zf.infolist() if not m.is_dir()]
+    if len(members) > _MAX_ZIP_FILES:
+        return jsonify({
+            "error": f"ZIP contains {len(members)} files; maximum is {_MAX_ZIP_FILES}."
+        }), 400
+
+    # Classify files
+    csv_xlsx: list = []
+    sql_files: list = []
+    skipped: list[str] = []
+
+    for info in members:
+        name = info.filename
+        # Path-traversal guard
+        if ".." in name or name.startswith("/"):
+            skipped.append(f"{name} (path traversal blocked)")
+            continue
+        basename = os.path.basename(name)
+        if not basename:
+            continue
+        ext = os.path.splitext(basename)[1].lower()
+        if ext in (".csv", ".xlsx"):
+            csv_xlsx.append(info)
+        elif ext == ".sql":
+            sql_files.append(info)
+        else:
+            skipped.append(f"{name} (unsupported type)")
+
+    if not csv_xlsx and not sql_files:
+        return jsonify({
+            "error": "ZIP contains no usable files (.csv, .xlsx, or .sql).",
+            "skipped": skipped,
+        }), 400
+
+    if sql_files and csv_xlsx:
+        return jsonify({
+            "error": "ZIP contains both .sql and .csv/.xlsx files. Include only one type per ZIP."
+        }), 400
+
+    if len(sql_files) > 1:
+        return jsonify({
+            "error": f"ZIP contains {len(sql_files)} .sql files; only one SQL dump per ZIP is supported."
+        }), 400
+
+    results: list[dict] = []
+
+    # ------------------------------------------------------------------ #
+    # SQL dump path                                                        #
+    # ------------------------------------------------------------------ #
+    if sql_files:
+        try:
+            sql_content = zf.read(sql_files[0].filename).decode("utf-8", errors="replace")
+        except Exception as exc:
+            return jsonify({"error": f"Could not read SQL file: {exc}"}), 400
+
+        # Capture table state before execution
+        try:
+            engine = get_engine()
+            with engine.connect() as conn:
+                existing = {
+                    r[0]
+                    for r in conn.execute(sqla_text(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+                    )).fetchall()
+                }
+        except Exception as exc:
+            return jsonify({"error": f"Could not query database: {exc}"}), 500
+
+        try:
+            dump_result = execute_sql_dump(sql_content, existing)
+        except (ValueError, RuntimeError) as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        for tname in dump_result["tables_created"]:
+            results.append({
+                "table_name": tname,
+                "row_count": dump_result["rows_inserted"].get(tname, 0),
+            })
+
+    # ------------------------------------------------------------------ #
+    # CSV / XLSX path                                                      #
+    # ------------------------------------------------------------------ #
+    else:
+        for info in csv_xlsx:
+            basename = os.path.basename(info.filename)
+            ext = os.path.splitext(basename)[1].lower()
+            stem = os.path.splitext(basename)[0]
+
+            try:
+                table_name = _sanitize_table_name(stem)
+            except ValueError as exc:
+                skipped.append(f"{info.filename} (bad table name: {exc})")
+                continue
+
+            if table_name in _PROTECTED_TABLES:
+                skipped.append(f"{info.filename} (reserved name: {table_name})")
+                continue
+
+            file_bytes = zf.read(info.filename)
+            try:
+                if ext == ".xlsx":
+                    df = pd.read_excel(io.BytesIO(file_bytes))
+                else:
+                    df = pd.read_csv(io.BytesIO(file_bytes))
+            except Exception as exc:
+                skipped.append(f"{info.filename} (parse error: {exc})")
+                continue
+
+            if df.empty or len(df.columns) == 0:
+                skipped.append(f"{info.filename} (empty)")
+                continue
+
+            if len(df) > _MAX_CSV_ROWS:
+                skipped.append(f"{info.filename} (exceeds {_MAX_CSV_ROWS:,} row limit)")
+                continue
+
+            _sanitize_col_names(df)
+
+            try:
+                row_count = create_table_from_dataframe(df, table_name)
+                results.append({"table_name": table_name, "row_count": row_count})
+                logger.info("ZIP: created table '%s' (%d rows).", table_name, row_count)
+            except Exception as exc:
+                skipped.append(f"{info.filename} (DB error: {exc})")
+
+    if not results:
+        return jsonify({
+            "error": "No tables were created. All files failed or were skipped.",
+            "skipped": skipped,
+        }), 400
+
+    # Re-embed schema once for all new tables
+    embedding_warning: str | None = None
+    try:
+        all_meta = get_schema_metadata()
+        if all_meta:
+            chunks = parse_schema_to_chunks(all_meta)
+            embed_fn(chunks)
+            logger.info(
+                "Schema re-embedded after ZIP upload (%d tables total, %d new).",
+                len(all_meta), len(results),
+            )
+    except Exception as exc:
+        embedding_warning = f"Tables created but schema indexing failed: {exc}"
+        logger.error("Schema embedding failed after ZIP upload: %s", exc)
+
+    response: dict = {
+        "zip": True,
+        "tables": results,
+        "table_count": len(results),
+    }
+    if skipped:
+        response["skipped"] = skipped
+    if embedding_warning:
+        response["embedding_warning"] = embedding_warning
+    return jsonify(response), 200
 
 
 # ---------------------------------------------------------------------------
