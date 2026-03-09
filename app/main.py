@@ -359,9 +359,8 @@ def create_app() -> Flask:
             200: {success: true, table_count: N}
             400: {error} — invalid input or connection failure
         """
-        from app.db import set_active_connection, get_engine
-        from app.embeddings import embed_and_store_schema
-        from sqlalchemy import text
+        from app.db import set_active_connection, copy_local_tables_to_external
+        from app.embeddings import clear_all_embeddings, embed_and_store_schema
 
         body = request.get_json(silent=True) or {}
         host     = str(body.get("host", "")).strip()
@@ -389,30 +388,49 @@ def create_app() -> Flask:
             logger.warning("External DB connection failed: %s", exc)
             return jsonify({"error": f"Connection failed: {exc}"}), 400
 
-        # Clear old embeddings and re-embed the new database's schema
+        # Copy local user-uploaded tables to external DB so cross-references work
+        tables_copied: list[str] = []
+        try:
+            tables_copied = copy_local_tables_to_external()
+            if tables_copied:
+                logger.info(
+                    "Copied %d local table(s) to external DB: %s",
+                    len(tables_copied), tables_copied,
+                )
+        except Exception as exc:
+            logger.warning("Copying local tables to external DB failed (non-fatal): %s", exc)
+
+        # Clear stale embeddings and re-embed the new database's schema
+        # (schema_metadata now includes the copied local tables too)
+        meta: list = []
+        tables_embedded: int = 0
         embedding_warning: str | None = None
         try:
-            with get_engine().connect() as conn:
-                try:
-                    conn.execute(text("DELETE FROM schema_embeddings"))
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
-
+            clear_all_embeddings()
             meta = get_schema_metadata()
             if meta:
                 chunks = parse_schema_to_chunks(meta)
                 embed_and_store_schema(chunks)
-                logger.info("Schema re-embedded for external DB (%d tables).", len(meta))
+                tables_embedded = len(meta)
+                logger.info(
+                    "Schema re-embedded for external DB '%s' (%d tables).",
+                    database, tables_embedded,
+                )
         except Exception as exc:
             logger.error("Schema re-embedding after connect failed: %s", exc)
             embedding_warning = str(exc)
-            try:
-                meta = get_schema_metadata()
-            except Exception:
-                meta = []
+            if not meta:
+                try:
+                    meta = get_schema_metadata()
+                except Exception:
+                    meta = []
 
-        response: dict = {"success": True, "table_count": len(meta)}
+        response: dict = {
+            "success": True,
+            "table_count": len(meta),
+            "tables_embedded": tables_embedded,
+            "tables_copied": tables_copied,
+        }
         if embedding_warning:
             response["embedding_warning"] = embedding_warning
         return jsonify(response), 200
@@ -439,21 +457,14 @@ def create_app() -> Flask:
         Returns:
             200: {success: true, message}
         """
-        from app.db import reset_connection, get_engine
-        from app.embeddings import embed_and_store_schema
-        from sqlalchemy import text
+        from app.db import reset_connection
+        from app.embeddings import clear_all_embeddings, embed_and_store_schema
 
         reset_connection()
 
         # Re-embed local schema
         try:
-            with get_engine().connect() as conn:
-                try:
-                    conn.execute(text("DELETE FROM schema_embeddings"))
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
-
+            clear_all_embeddings()
             meta = get_schema_metadata()
             if meta:
                 chunks = parse_schema_to_chunks(meta)

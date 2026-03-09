@@ -44,6 +44,7 @@ Rules:
 - Do NOT include a semicolon at the end.
 - Never use DROP, DELETE, INSERT, UPDATE, ALTER, CREATE, TRUNCATE, EXEC, or EXECUTE.
 - CRITICAL: Use table and column names EXACTLY as they appear in the schema context. Do NOT infer, guess, or use common variations. For example, if the schema shows "invoice_line", you must write "invoice_line" — never "invoiceline" or "InvoiceLine".
+- CRITICAL: If a table or column name contains any uppercase letter (e.g. "salePrice", "userId", "ProductId"), you MUST wrap it in double quotes in the SQL (e.g. "salePrice", "userId", "ProductId"). Unquoted identifiers are lowercased by PostgreSQL and will cause errors.
 - Only reference tables and columns that are explicitly listed in the provided schema. If a table you need is not in the schema, respond with CANNOT_ANSWER.
 - If the question cannot be answered at all from the given schema, respond with exactly: CANNOT_ANSWER
 - If the question is ambiguous but a reasonable interpretation exists using the available tables, write the SQL for that interpretation.

@@ -72,6 +72,26 @@ def _ensure_table_exists() -> None:
 # Public API
 # ---------------------------------------------------------------------------
 
+def clear_all_embeddings() -> None:
+    """
+    Delete all rows from schema_embeddings, removing stale schema context.
+
+    Called before re-embedding when switching databases so old chunks
+    don't pollute retrieval results.
+
+    Raises:
+        RuntimeError: If the DELETE fails for any reason.
+    """
+    engine = get_engine()
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("DELETE FROM schema_embeddings"))
+            conn.commit()
+        logger.info("Cleared all schema embeddings.")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to clear schema embeddings: {exc}") from exc
+
+
 def embed_and_store_schema(chunks: list[str]) -> None:
     """
     Generate embeddings for schema chunks and upsert them into schema_embeddings.

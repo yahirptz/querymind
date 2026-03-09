@@ -88,7 +88,10 @@ def set_active_connection(host: str, port: int, user: str, password: str, databa
         max_overflow=5,
         pool_pre_ping=True,
         echo=False,
-        connect_args={"connect_timeout": 5},
+        connect_args={
+            "connect_timeout": 5,
+            "sslmode": "require",
+        },
     )
 
     # Validate the connection before storing it
@@ -357,6 +360,125 @@ def create_table_from_dataframe(df: Any, table_name: str) -> int:
 
     logger.info("Created/replaced table '%s' with %d rows.", table_name, len(df))
     return len(df)
+
+
+# ---------------------------------------------------------------------------
+# Copy local tables to external DB
+# ---------------------------------------------------------------------------
+
+# Tables that are built-in and should NOT be copied to external DBs.
+_LOCAL_ONLY_TABLES: frozenset[str] = frozenset({
+    "schema_embeddings", "query_history",
+    "album", "artist", "customer", "employee", "genre",
+    "invoice", "invoice_line", "media_type", "playlist",
+    "playlist_track", "track",
+})
+
+_PG_TYPE_MAP: dict[str, str] = {
+    "bigint": "BIGINT",
+    "integer": "INTEGER",
+    "smallint": "SMALLINT",
+    "double precision": "DOUBLE PRECISION",
+    "real": "REAL",
+    "boolean": "BOOLEAN",
+    "timestamp without time zone": "TIMESTAMP",
+    "timestamp with time zone": "TIMESTAMPTZ",
+    "text": "TEXT",
+    "character varying": "TEXT",
+    "numeric": "NUMERIC",
+    "date": "DATE",
+}
+
+
+def copy_local_tables_to_external() -> list[str]:
+    """
+    Copy all user-uploaded local tables to the currently active external DB.
+
+    Skips tables that already exist on the external DB.
+
+    Returns:
+        List of table names successfully copied.
+    """
+    local_engine = get_engine()
+    external_engine = get_query_engine()
+
+    if external_engine is local_engine:
+        return []  # No external connection active
+
+    # Discover user-uploaded tables in local DB
+    with local_engine.connect() as conn:
+        all_local = [
+            row[0]
+            for row in conn.execute(text(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_type = 'BASE TABLE' "
+                "ORDER BY table_name"
+            )).fetchall()
+        ]
+
+    user_tables = [t for t in all_local if t not in _LOCAL_ONLY_TABLES]
+    if not user_tables:
+        return []
+
+    # Tables already on the external DB (skip these)
+    with external_engine.connect() as conn:
+        existing_external: set[str] = {
+            row[0]
+            for row in conn.execute(text(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+            )).fetchall()
+        }
+
+    copied: list[str] = []
+    for tname in user_tables:
+        if tname in existing_external:
+            logger.info("Skipping '%s' — already exists on external DB.", tname)
+            continue
+        try:
+            # Read column definitions from local
+            with local_engine.connect() as conn:
+                col_info = conn.execute(text("""
+                    SELECT column_name, data_type
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = :t
+                    ORDER BY ordinal_position
+                """), {"t": tname}).fetchall()
+
+                result = conn.execute(text(f'SELECT * FROM "{tname}"'))
+                rows = result.fetchall()
+                cols = list(result.keys())
+
+            col_defs = ", ".join(
+                f'"{col}" {_PG_TYPE_MAP.get(dtype, "TEXT")}'
+                for col, dtype in col_info
+            )
+
+            col_names   = ", ".join(f'"{c}"' for c in cols)
+            placeholders = ", ".join(f":{c}" for c in cols)
+            insert_sql  = text(
+                f'INSERT INTO "{tname}" ({col_names}) VALUES ({placeholders})'
+            )
+
+            with external_engine.connect() as conn:
+                conn.execute(text(
+                    f'CREATE TABLE IF NOT EXISTS "{tname}" ({col_defs})'
+                ))
+                if rows:
+                    records = [dict(zip(cols, row)) for row in rows]
+                    chunk = 500
+                    for i in range(0, len(records), chunk):
+                        conn.execute(insert_sql, records[i : i + chunk])
+                conn.commit()
+
+            copied.append(tname)
+            logger.info(
+                "Copied local table '%s' (%d rows) to external DB.", tname, len(rows)
+            )
+        except Exception as exc:
+            logger.error("Failed to copy '%s' to external DB: %s", tname, exc)
+
+    return copied
 
 
 # ---------------------------------------------------------------------------
